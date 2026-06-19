@@ -678,7 +678,9 @@ class KubernetesHook(BaseHook, PodOperatorHookProtocol):
         while True:
             self.log.info("Requesting status for the job '%s' ", job_name)
             job: V1Job = self.get_job_status(job_name=job_name, namespace=namespace)
-            if self.is_job_complete(job=job):
+            if self.is_job_suspended(job):
+                self.log.info("The job '%s' is suspended by Kueue, waiting for resources...", job_name)
+            elif self.is_job_complete(job=job):
                 return job
             self.log.info("The job '%s' is incomplete. Sleeping for %i sec.", job_name, job_poll_interval)
             sleep(job_poll_interval)
@@ -746,6 +748,18 @@ class KubernetesHook(BaseHook, PodOperatorHookProtocol):
         if status := job.status:
             conditions = status.conditions or []
             return bool(next((c for c in conditions if c.type == "Complete" and c.status), None))
+        return False
+
+    @staticmethod
+    def is_job_suspended(job: V1Job) -> bool:
+        """
+        Check whether the given job is suspended by Kueue.
+
+        :return: Boolean indicating that the given job is suspended.
+        """
+        if status := job.status:
+            conditions = status.conditions or []
+            return bool(next((c for c in conditions if c.type == "Suspended" and c.status), None))
         return False
 
     @generic_api_retry
@@ -1336,7 +1350,9 @@ class AsyncKubernetesHook(KubernetesHook):
         while True:
             self.log.info("Requesting status for the job '%s' ", name)
             job: V1Job = await self.get_job_status(name=name, namespace=namespace)
-            if self.is_job_complete(job=job):
+            if self.is_job_suspended(job):
+                self.log.info("The job '%s' is suspended by Kueue, waiting for resources...", job_name)
+            elif self.is_job_complete(job=job):
                 return job
             self.log.info("The job '%s' is incomplete. Sleeping for %i sec.", name, poll_interval)
             await asyncio.sleep(poll_interval)
