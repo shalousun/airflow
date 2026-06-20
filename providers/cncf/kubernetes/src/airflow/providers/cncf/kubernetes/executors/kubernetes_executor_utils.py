@@ -420,6 +420,27 @@ class KubernetesJobWatcher(multiprocessing.Process, LoggingMixin):
                 )
             else:
                 self.log.info("Event: %s is Running, annotations: %s", pod_name, annotations_string)
+        elif status == "Suspended":
+            # When Kueue suspends a pod/job due to lack of resources, we should not fail the task
+            # The pod/job remains in suspended state until resources are available
+            # No pod is created when suspended, so we don't query for pods
+            key = annotations_to_key(annotations=annotations)
+            task_key_str = f"{key.dag_id}.{key.task_id}.{key.try_number}" if key else "unknown"
+            self.log.info(
+                "Event: %s is Suspended by Kueue, task: %s, annotations: %s",
+                pod_name, task_key_str, annotations_string
+            )
+            # Send QUEUED state to indicate task is waiting for resources
+            self.watcher_queue.put(
+                KubernetesWatch(
+                    pod_name,
+                    namespace,
+                    TaskInstanceState.QUEUED,  # Use QUEUED to indicate waiting state
+                    annotations,
+                    resource_version,
+                    None,
+                )
+            )
         else:
             self.log.warning(
                 "Event: Invalid state: %s on pod: %s in namespace %s with annotations: %s with "
