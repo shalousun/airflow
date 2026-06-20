@@ -455,6 +455,14 @@ class KubernetesExecutor(BaseExecutor):
                 self.log.warning(
                     "Task %s failed in pod %s/%s (no details available)", task_key_str, namespace, pod_name
                 )
+        elif state == TaskInstanceState.QUEUED:
+            # Handle Suspended state from Kueue
+            self.log.info(
+                "Task %s is queued by Kueue (Suspended), waiting for resources",
+                key
+            )
+            self.event_buffer[key] = state, None
+            return
 
         if state == ADOPTED:
             # When the task pod is adopted by another executor,

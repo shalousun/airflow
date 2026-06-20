@@ -81,6 +81,7 @@ class KubernetesJobWatcher(multiprocessing.Process, LoggingMixin):
         self.scheduler_job_id = scheduler_job_id
         self.watcher_queue = watcher_queue
         self.resource_version = resource_version
+        self.job_resource_version = resource_version
         self.kube_config = kube_config
 
     def run(self) -> None:
@@ -93,6 +94,14 @@ class KubernetesJobWatcher(multiprocessing.Process, LoggingMixin):
             try:
                 self.resource_version = self._run(
                     kube_client, self.resource_version, self.scheduler_job_id, self.kube_config
+                )
+
+                # Start job watcher for Suspended state detection
+                self.job_resource_version = self._run_job_watcher(
+                    kube_client.batch_v1_api,
+                    self.resource_version,
+                    self.scheduler_job_id,
+                    self.kube_config,
                 )
             except ReadTimeoutError:
                 self.log.info("Kubernetes watch timed out waiting for events. Restarting watch.")
@@ -180,6 +189,73 @@ class KubernetesJobWatcher(multiprocessing.Process, LoggingMixin):
                 event=event,
             )
             last_resource_version = task.metadata.resource_version
+
+        return last_resource_version
+
+    def _run_job_watcher(
+        self,
+        kube_client: client.BatchV1Api,
+        resource_version: str | None,
+        scheduler_job_id: str,
+        kube_config: Any,
+    ) -> str | None:
+        """Watch Job events to detect Suspended state."""
+        self.log.info("Job watcher starting at resource_version: %s", resource_version)
+
+        kwargs: dict[str, Any] = {
+            "label_selector": f"airflow-worker={scheduler_job_id}",
+        }
+        if resource_version:
+            kwargs["resource_version"] = resource_version
+        if kube_config.kube_client_request_args:
+            for key, value in kube_config.kube_client_request_args.items():
+                kwargs[key] = value
+
+        last_resource_version: str | None = None
+
+        if "_request_timeout" not in kwargs:
+            kwargs["_request_timeout"] = 30
+        if "timeout_seconds" not in kwargs:
+            kwargs["timeout_seconds"] = 3600
+
+        for event in self._job_events(kube_client=kube_client, query_kwargs=kwargs):
+            job = event["object"]
+            self.log.debug("Job event: %s had an event of type %s", job.metadata.name, event["type"])
+            if event["type"] == "ERROR":
+                return self.process_error(event)
+
+                # Check for Suspended state
+            from airflow.providers.cncf.kubernetes.hooks.kubernetes import KubernetesHook
+            hook = KubernetesHook()
+            if hook.is_job_suspended(job):
+                # Extract task info from job labels/annotations
+                annotations = job.metadata.annotations or {}
+                task_instance_related_annotations = {
+                    "dag_id": annotations.get("dag_id"),
+                    "task_id": annotations.get("task_id"),
+                    "run_id": annotations.get("run_id"),
+                    "try_number": annotations.get("try_number"),
+                }
+                map_index = annotations.get("map_index")
+                if map_index is not None:
+                    task_instance_related_annotations["map_index"] = map_index
+
+                self.log.info(
+                    "Job %s is Suspended by Kueue, marking task as QUEUED",
+                    job.metadata.name
+                )
+                self.watcher_queue.put(
+                    KubernetesWatch(
+                        job.metadata.name,
+                        job.metadata.namespace,
+                        TaskInstanceState.QUEUED,
+                        task_instance_related_annotations,
+                        job.metadata.resource_version,
+                        None,
+                    )
+                )
+
+            last_resource_version = job.metadata.resource_version
 
         return last_resource_version
 
@@ -463,6 +539,24 @@ def _analyze_main_containers(pod_status: k8s.V1PodStatus) -> FailureDetails | No
     """Analyze main container statuses for failure details."""
     container_statuses = getattr(pod_status, "container_statuses", None)
     return _analyze_containers(container_statuses, "main")
+
+def _job_events(self, kube_client: client.BatchV1Api, query_kwargs: dict):
+    """Watch for Job events to detect Suspended state."""
+    watcher = watch.Watch()
+    try:
+        if self.namespace == ALL_NAMESPACES:
+            return watcher.stream(kube_client.list_job_for_all_namespaces, **query_kwargs)
+        return watcher.stream(kube_client.list_namespaced_job, self.namespace, **query_kwargs)
+    except ApiException as e:
+        if str(e.status) == "410":  # Resource version is too old
+            if self.namespace == ALL_NAMESPACES:
+                jobs = kube_client.list_job_for_all_namespaces(watch=False)
+            else:
+                jobs = kube_client.list_namespaced_job(namespace=self.namespace, watch=False)
+            resource_version = jobs.metadata.resource_version
+            query_kwargs["resource_version"] = resource_version
+            return self._job_events(kube_client=kube_client, query_kwargs=query_kwargs)
+        raise
 
 
 class AirflowKubernetesScheduler(LoggingMixin):
