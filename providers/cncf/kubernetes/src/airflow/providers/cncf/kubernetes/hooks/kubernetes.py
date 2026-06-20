@@ -757,9 +757,12 @@ class KubernetesHook(BaseHook, PodOperatorHookProtocol):
 
         :return: Boolean indicating that the given job is suspended.
         """
-        if status := job.status:
-            conditions = status.conditions or []
-            return bool(next((c for c in conditions if c.type == "Suspended" and c.status), None))
+        if job.spec and job.spec.suspend:
+            return True
+        if job.status and job.status.conditions:
+            for condition in job.status.conditions:
+                if condition.type == "Suspended" and condition.status == "True":
+                    return True
         return False
 
     @generic_api_retry

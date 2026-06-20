@@ -221,9 +221,16 @@ class KubernetesJobOperator(KubernetesPodOperator):
 
         try:
             if self.wait_until_job_complete:
-                self.pods: Sequence[k8s.V1Pod] = self.get_pods(
-                    pod_request_obj=self.pod_request_obj, context=context
-                )
+                # wait for job to be scheduled
+                if self.hook.is_job_suspended(job=self.job):
+                    self.log.info(
+                        "Job '%s' is suspended by Kueue, skipping pod discovery until resources are available",
+                        self.job.metadata.name
+                    )
+                else:
+                    self.pods: Sequence[k8s.V1Pod] = self.get_pods(
+                        pod_request_obj=self.pod_request_obj, context=context
+                    )
 
                 if self.deferrable:
                     self.execute_deferrable()
@@ -245,12 +252,13 @@ class KubernetesJobOperator(KubernetesPodOperator):
                     job_poll_interval=self.job_poll_interval,
                 )
                 if self.get_logs:
-                    for pod in self.pods:
-                        self.pod_manager.fetch_requested_container_logs(
-                            pod=pod,
-                            containers=self.container_logs,
-                            follow_logs=True,
-                        )
+                    if not self.hook.is_job_suspended(job=self.job) and hasattr(self, 'pods'):
+                        for pod in self.pods:
+                            self.pod_manager.fetch_requested_container_logs(
+                                pod=pod,
+                                containers=self.container_logs,
+                                follow_logs=True,
+                            )
 
             ti.xcom_push(key="job", value=self.job.to_dict())
             if self.wait_until_job_complete:
