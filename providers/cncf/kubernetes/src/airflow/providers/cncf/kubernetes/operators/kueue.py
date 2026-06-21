@@ -130,3 +130,133 @@ class KubernetesStartKueueJobOperator(KubernetesJobOperator):
             self.suspend = True
         self.labels.update({"kueue.x-k8s.io/queue-name": self.queue_name})
         self.annotations.update({"kueue.x-k8s.io/queue-name": self.queue_name})
+
+    def execute(self, context):
+        import warnings
+
+        from airflow.exceptions import AirflowProviderDeprecationWarning
+
+        self.name = self._set_name(self.name)
+        if self.parallelism is None:
+            warnings.warn(
+                "parallelism should be set explicitly. Defaulting to 1.",
+                AirflowProviderDeprecationWarning,
+                stacklevel=2,
+            )
+            self.parallelism = 1
+        elif self.wait_until_job_complete and self.parallelism < 1:
+            raise AirflowException("parallelism cannot be less than 1 with `wait_until_job_complete=True`.")
+        self.job_request_obj = self.build_job_request_obj(context)
+        self.job = self.create_job(job_request_obj=self.job_request_obj)
+
+        ti = context["ti"]
+        ti.xcom_push(key="job_name", value=self.job.metadata.name)
+        ti.xcom_push(key="job_namespace", value=self.job.metadata.namespace)
+
+        try:
+            if not self.wait_until_job_complete:
+                ti.xcom_push(key="job", value=self.job.to_dict())
+                return
+
+            if self.hook.is_job_suspended(job=self.job):
+                self._defer_when_suspended(ti)
+
+            return self._wait_for_job_completion(context)
+        finally:
+            self._cleanup_monitoring_pods(context)
+
+    def _defer_when_suspended(self, ti):
+        """Query the Kueue Workload for the suspension reason, log it, and defer."""
+        job_name = self.job.metadata.name
+        job_namespace = self.job.metadata.namespace
+
+        reason = self.hook.get_kueue_workload_info(job_name=job_name, namespace=job_namespace)
+        if reason:
+            self.log.warning(
+                "Job '%s' is suspended by Kueue: %s. Deferring poll for %s seconds.",
+                job_name,
+                reason,
+                self.job_poll_interval,
+            )
+            ti.xcom_push(key="kueue_suspend_reason", value=reason)
+        else:
+            self.log.info(
+                "Job '%s' is suspended by Kueue, deferring poll for %s seconds.",
+                job_name,
+                self.job_poll_interval,
+            )
+
+        from airflow.providers.cncf.kubernetes.triggers.job import (
+            KueueSuspendTrigger,
+        )
+
+        self.defer(
+            trigger=KueueSuspendTrigger(
+                job_name=job_name,
+                job_namespace=job_namespace,
+                poll_interval=self.job_poll_interval,
+            ),
+            method_name="execute_complete",
+        )
+
+    def _wait_for_job_completion(self, context):
+        """Discover pods (if any) and wait for the K8s Job to finish."""
+        ti = context["ti"]
+        ti.xcom_push(key="kueue_suspend_reason", value="")  # clear the suspend reason
+        self.log.info(
+            "Job '%s' has been admitted by Kueue, waiting for pods and completion.",
+            self.job.metadata.name,
+        )
+        self.pods = self.get_pods(pod_request_obj=self.pod_request_obj, context=context)
+
+        if self.do_xcom_push:
+            xcom_result = []
+            if self.pods:
+                for pod in self.pods:
+                    self.pod_manager.await_container_completion(
+                        pod=pod, container_name=self.base_container_name
+                    )
+                    self.pod_manager.await_xcom_sidecar_container_start(pod=pod)
+                    xcom_result.append(self.extract_xcom(pod=pod))
+
+        self.job = self.hook.wait_until_job_complete(
+            job_name=self.job.metadata.name,
+            namespace=self.job.metadata.namespace,
+            job_poll_interval=self.job_poll_interval,
+        )
+
+        if self.get_logs:
+            if not self.hook.is_job_suspended(job=self.job) and self.pods:
+                for pod in self.pods:
+                    self.pod_manager.fetch_requested_container_logs(
+                        pod=pod,
+                        containers=self.container_logs,
+                        follow_logs=True,
+                    )
+
+        ti.xcom_push(key="job", value=self.job.to_dict())
+
+        if error_message := self.hook.is_job_failed(job=self.job):
+            raise AirflowException(
+                f"Kubernetes job '{self.job.metadata.name}' failed with error '{error_message}'"
+            )
+
+        if self.do_xcom_push:
+            return xcom_result[0] if self.unwrap_single and len(xcom_result) == 1 else xcom_result
+
+    def execute_complete(self, context, event):
+        # Re-fetch job status using the sync hook in the worker process.
+        # The trigger (KueueSuspendTrigger) does NOT query K8s — it only
+        # sleeps, so the actual API call happens here in the worker.
+        try:
+            self.job = self.hook.get_job_status(
+                job_name=self.job.metadata.name,
+                namespace=self.job.metadata.namespace,
+            )
+
+            if self.hook.is_job_suspended(self.job):
+                self._defer_when_suspended(context["ti"])
+
+            return self._wait_for_job_completion(context)
+        finally:
+            self._cleanup_monitoring_pods(context)

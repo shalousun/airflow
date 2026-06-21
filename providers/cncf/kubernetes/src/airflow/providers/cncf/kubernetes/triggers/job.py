@@ -28,6 +28,38 @@ from airflow.providers.cncf.kubernetes.utils.pod_manager import PodManager
 from airflow.providers.cncf.kubernetes.utils.xcom_sidecar import PodDefaults
 from airflow.triggers.base import BaseTrigger, TriggerEvent
 
+
+class KueueSuspendTrigger(BaseTrigger):
+    """
+    Time-based trigger for Kueue-suspended jobs.
+
+    This trigger does NOT query the Kubernetes API — it only sleeps for
+    *poll_interval* seconds and then fires.  The actual job-status check
+    happens in the worker (via the sync KubernetesHook) when the task
+    resumes.  This avoids putting K8s API pressure on the triggerer.
+    """
+
+    def __init__(self, job_name: str, job_namespace: str, poll_interval: float = 10.0):
+        super().__init__()
+        self.job_name = job_name
+        self.job_namespace = job_namespace
+        self.poll_interval = poll_interval
+
+    def serialize(self) -> tuple[str, dict[str, Any]]:
+        return (
+            "airflow.providers.cncf.kubernetes.triggers.job.KueueSuspendTrigger",
+            {
+                "job_name": self.job_name,
+                "job_namespace": self.job_namespace,
+                "poll_interval": self.poll_interval,
+            },
+        )
+
+    async def run(self) -> AsyncIterator[TriggerEvent]:
+        await asyncio.sleep(self.poll_interval)
+        yield TriggerEvent({"status": "pending"})
+
+
 if TYPE_CHECKING:
     from kubernetes.client import V1Job
 

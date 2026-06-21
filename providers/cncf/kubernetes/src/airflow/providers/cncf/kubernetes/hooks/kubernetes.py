@@ -767,6 +767,38 @@ class KubernetesHook(BaseHook, PodOperatorHookProtocol):
                     return True
         return False
 
+    def get_kueue_workload_info(self, job_name: str, namespace: str) -> str | None:
+        """
+        Return a human-readable summary of why a Kueue Workload is suspended.
+
+        Queries the Kueue Workload CRD associated with *job_name* and extracts
+        the ``Admitted`` / ``QuotaReserved`` / ``Finished`` conditions.
+
+        :return: a one-line reason string, or ``None`` if the workload cannot
+            be fetched or no relevant condition is found.
+        """
+        try:
+            workload = self.get_custom_object(
+                group="kueue.x-k8s.io",
+                version="v1beta1",
+                plural="workloads",
+                name=job_name,
+                namespace=namespace,
+            )
+        except Exception:
+            self.log.debug("Failed to fetch Kueue Workload for job '%s'", job_name, exc_info=True)
+            return None
+
+        conditions = (workload.get("status") or {}).get("conditions") or []
+        for cond_type in ("Admitted", "QuotaReserved"):
+            for c in conditions:
+                if c.get("type") == cond_type and c.get("status") == "False":
+                    reason = c.get("reason", "Unknown")
+                    message = c.get("message", "")
+                    detail = f": {message}" if message else ""
+                    return f"{cond_type}={reason}{detail}"
+        return None
+
     @generic_api_retry
     def patch_namespaced_job(self, job_name: str, namespace: str, body: object) -> V1Job:
         """

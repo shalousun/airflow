@@ -2712,44 +2712,6 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                     ),
                 )
 
-        def _check_kueue_job_status(dag_run: DagRun) -> bool:
-            """Check if the Kueue job is admitted (not suspended)."""
-            from airflow.providers.cncf.kubernetes.hooks.kubernetes import KubernetesHook
-            from airflow.configuration import conf
-
-            try:
-                # Get Kubernetes connection configuration
-                kubernetes_conn_id = conf.get("kubernetes", "KUBE_CONN_ID", fallback="kubernetes_default")
-
-                # Initialize the Kubernetes hook
-                hook = KubernetesHook(conn_id=kubernetes_conn_id)
-
-                # Get namespace using the hook's method which follows proper precedence
-                namespace = hook.get_namespace() or hook.DEFAULT_NAMESPACE
-
-                # Get the job status from Kubernetes
-                job = hook.get_job_status(name=dag_run.run_id, namespace=namespace)
-
-                # Check if the job is suspended
-                if job and job.status and job.status.suspended is not None:
-                    is_suspended = job.status.suspended
-                    if is_suspended:
-                        self.log.info("Kueue job %s is suspended, not starting DagRun", dag_run.run_id)
-                        return False
-                    else:
-                        self.log.info("Kueue job %s is admitted (not suspended)", dag_run.run_id)
-                        return True
-
-                        # If we can't determine suspension status, fail open
-                self.log.warning("Could not determine suspension status for job %s, allowing DagRun to start",
-                                 dag_run.run_id)
-                return True
-
-            except Exception as e:
-                self.log.warning("Failed to check Kueue job status for %s: %s. Allowing DagRun to start.",
-                                 dag_run.run_id, e)
-                return True  # Fail open to avoid blocking all runs
-
         # cache saves time during scheduling of many dag_runs for same dag
         cached_get_dag: Callable[[DagRun], SerializedDAG | None] = lru_cache()(
             partial(self.scheduler_dag_bag.get_dag_for_run, session=session)
@@ -2794,13 +2756,6 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                         dag_run.run_id,
                     )
                     continue
-                    # NEW: Check Kueue job status before transitioning to RUNNING
-            if not _check_kueue_job_status(dag_run):
-                self.log.info(
-                    "dag run %s cannot be started because Kueue job is suspended",
-                    run_id,
-                )
-                continue
             active_runs_of_dags[(dag_run.dag_id, backfill_id)] += 1
             _update_state(dag, dag_run)
             dag_run.notify_dagrun_state_changed(msg="started")
