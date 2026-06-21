@@ -31,19 +31,35 @@ from airflow.triggers.base import BaseTrigger, TriggerEvent
 
 class KueueSuspendTrigger(BaseTrigger):
     """
-    Time-based trigger for Kueue-suspended jobs.
+    Wait for a Kueue-suspended Job to be admitted.
 
-    This trigger does NOT query the Kubernetes API — it only sleeps for
-    *poll_interval* seconds and then fires.  The actual job-status check
-    happens in the worker (via the sync KubernetesHook) when the task
-    resumes.  This avoids putting K8s API pressure on the triggerer.
+    By default uses a simple sleep (zero K8s connections, no API server
+    impact).  When *use_watch* is ``True`` it opens a Kubernetes watch on
+    the specific Job so the task is resumed as soon as Kueue admits it.
     """
 
-    def __init__(self, job_name: str, job_namespace: str, poll_interval: float = 10.0):
+    def __init__(
+        self,
+        job_name: str,
+        job_namespace: str,
+        job_uid: str = "",
+        poll_interval: float = 10.0,
+        use_watch: bool = False,
+        kubernetes_conn_id: str | None = None,
+        cluster_context: str | None = None,
+        config_file: str | None = None,
+        in_cluster: bool | None = None,
+    ):
         super().__init__()
         self.job_name = job_name
         self.job_namespace = job_namespace
+        self.job_uid = job_uid
         self.poll_interval = poll_interval
+        self.use_watch = use_watch
+        self.kubernetes_conn_id = kubernetes_conn_id
+        self.cluster_context = cluster_context
+        self.config_file = config_file
+        self.in_cluster = in_cluster
 
     def serialize(self) -> tuple[str, dict[str, Any]]:
         return (
@@ -51,13 +67,82 @@ class KueueSuspendTrigger(BaseTrigger):
             {
                 "job_name": self.job_name,
                 "job_namespace": self.job_namespace,
+                "job_uid": self.job_uid,
                 "poll_interval": self.poll_interval,
+                "use_watch": self.use_watch,
+                "kubernetes_conn_id": self.kubernetes_conn_id,
+                "cluster_context": self.cluster_context,
+                "config_file": self.config_file,
+                "in_cluster": self.in_cluster,
             },
         )
 
     async def run(self) -> AsyncIterator[TriggerEvent]:
-        await asyncio.sleep(self.poll_interval)
-        yield TriggerEvent({"status": "pending"})
+        if self.use_watch:
+            async for event in self._run_watch():
+                yield event
+        else:
+            await asyncio.sleep(self.poll_interval)
+            yield TriggerEvent(
+                {
+                    "status": "pending",
+                    "job_name": self.job_name,
+                    "job_namespace": self.job_namespace,
+                    "job_uid": self.job_uid,
+                }
+            )
+
+    async def _run_watch(self) -> AsyncIterator[TriggerEvent]:
+        from kubernetes_asyncio import client as async_client, watch as async_watch
+
+        try:
+            async with self.hook.get_conn() as conn:
+                batch_api = async_client.BatchV1Api(conn)
+                w = async_watch.Watch()
+                async for event in w.stream(
+                    batch_api.list_namespaced_job,
+                    namespace=self.job_namespace,
+                    field_selector=f"metadata.name={self.job_name}",
+                    timeout_seconds=self.poll_interval,
+                ):
+                    job = event.get("object")
+                    if job and not self.hook.is_job_suspended(job):
+                        self.log.info(
+                            "Job '%s' was admitted by Kueue, resuming task.",
+                            self.job_name,
+                        )
+                        yield TriggerEvent(
+                            {
+                                "status": "admitted",
+                                "job_name": self.job_name,
+                                "job_namespace": self.job_namespace,
+                                "job_uid": self.job_uid,
+                            }
+                        )
+                        return
+        except Exception:
+            self.log.debug(
+                "Watch for job '%s' ended, resuming task to re-check.",
+                self.job_name,
+                exc_info=True,
+            )
+        yield TriggerEvent(
+            {
+                "status": "pending",
+                "job_name": self.job_name,
+                "job_namespace": self.job_namespace,
+                "job_uid": self.job_uid,
+            }
+        )
+
+    @cached_property
+    def hook(self) -> AsyncKubernetesHook:
+        return AsyncKubernetesHook(
+            conn_id=self.kubernetes_conn_id,
+            in_cluster=self.in_cluster,
+            config_file=self.config_file,
+            cluster_context=self.cluster_context,
+        )
 
 
 if TYPE_CHECKING:

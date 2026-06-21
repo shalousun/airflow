@@ -767,26 +767,19 @@ class KubernetesHook(BaseHook, PodOperatorHookProtocol):
                     return True
         return False
 
-    def get_kueue_workload_info(self, job_name: str, namespace: str) -> str | None:
+    def get_kueue_workload_info(self, job_name: str, job_uid: str, namespace: str) -> str | None:
         """
         Return a human-readable summary of why a Kueue Workload is suspended.
 
-        Queries the Kueue Workload CRD associated with *job_name* and extracts
-        the ``Admitted`` / ``QuotaReserved`` / ``Finished`` conditions.
+        Finds the Kueue Workload associated with *job_uid* via the
+        ``kueue.x-k8s.io/job-uid`` label.  *job_name* is only used in log
+        messages to aid troubleshooting.
 
         :return: a one-line reason string, or ``None`` if the workload cannot
             be fetched or no relevant condition is found.
         """
-        try:
-            workload = self.get_custom_object(
-                group="kueue.x-k8s.io",
-                version="v1beta1",
-                plural="workloads",
-                name=job_name,
-                namespace=namespace,
-            )
-        except Exception:
-            self.log.debug("Failed to fetch Kueue Workload for job '%s'", job_name, exc_info=True)
+        workload = self._find_kueue_workload(job_name, job_uid, namespace)
+        if not workload:
             return None
 
         conditions = (workload.get("status") or {}).get("conditions") or []
@@ -797,6 +790,32 @@ class KubernetesHook(BaseHook, PodOperatorHookProtocol):
                     message = c.get("message", "")
                     detail = f": {message}" if message else ""
                     return f"{cond_type}={reason}{detail}"
+        return None
+
+    def _find_kueue_workload(self, job_name: str, job_uid: str, namespace: str) -> dict | None:
+        api = client.CustomObjectsApi(self.api_client)
+        ns = namespace or self.get_namespace() or self.DEFAULT_NAMESPACE
+
+        try:
+            response = api.list_namespaced_custom_object(
+                group="kueue.x-k8s.io",
+                version="v1beta1",
+                namespace=ns,
+                plural="workloads",
+                label_selector=f"kueue.x-k8s.io/job-uid={job_uid}",
+            )
+            items = (response or {}).get("items") or []
+            if items:
+                return items[0]
+        except Exception:
+            self.log.debug(
+                "Failed to find Kueue Workload for job '%s' (uid=%s)",
+                job_name,
+                job_uid,
+                exc_info=True,
+            )
+
+        self.log.debug("No Kueue Workload found for job '%s' (uid=%s)", job_name, job_uid)
         return None
 
     @generic_api_retry

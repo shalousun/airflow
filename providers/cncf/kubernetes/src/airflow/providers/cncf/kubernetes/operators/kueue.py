@@ -107,13 +107,18 @@ class KubernetesStartKueueJobOperator(KubernetesJobOperator):
         :ref:`howto/operator:KubernetesStartKueueJobOperator`
 
     :param queue_name: The name of the Queue in the cluster
+    :param use_watch: When ``True``, use a Kubernetes watch on the suspended
+        Job so the task resumes immediately when Kueue admits it.  When
+        ``False`` (the default), the trigger simply sleeps for
+        *job_poll_interval* — zero K8s API connections while waiting.
     """
 
     template_fields = tuple({"queue_name"} | set(KubernetesJobOperator.template_fields))
 
-    def __init__(self, queue_name: str, *args, **kwargs) -> None:
+    def __init__(self, queue_name: str, use_watch: bool = False, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.queue_name = queue_name
+        self.use_watch = use_watch
 
         self.suspend: bool
         if self.suspend is False:
@@ -149,9 +154,14 @@ class KubernetesStartKueueJobOperator(KubernetesJobOperator):
         self.job_request_obj = self.build_job_request_obj(context)
         self.job = self.create_job(job_request_obj=self.job_request_obj)
 
+        # Persist as plain strings — V1Job may not survive defer serialisation.
+        self._kueue_job_name = self.job.metadata.name
+        self._kueue_job_namespace = self.job.metadata.namespace
+        self._kueue_job_uid = self.job.metadata.uid
+
         ti = context["ti"]
-        ti.xcom_push(key="job_name", value=self.job.metadata.name)
-        ti.xcom_push(key="job_namespace", value=self.job.metadata.namespace)
+        ti.xcom_push(key="job_name", value=self._kueue_job_name)
+        ti.xcom_push(key="job_namespace", value=self._kueue_job_namespace)
 
         try:
             if not self.wait_until_job_complete:
@@ -167,23 +177,22 @@ class KubernetesStartKueueJobOperator(KubernetesJobOperator):
 
     def _defer_when_suspended(self, ti):
         """Query the Kueue Workload for the suspension reason, log it, and defer."""
-        job_name = self.job.metadata.name
-        job_namespace = self.job.metadata.namespace
-
-        reason = self.hook.get_kueue_workload_info(job_name=job_name, namespace=job_namespace)
+        reason = self.hook.get_kueue_workload_info(
+            job_name=self._kueue_job_name,
+            job_uid=self._kueue_job_uid,
+            namespace=self._kueue_job_namespace,
+        )
         if reason:
             self.log.warning(
-                "Job '%s' is suspended by Kueue: %s. Deferring poll for %s seconds.",
-                job_name,
+                "Job '%s' is suspended by Kueue: %s. Waiting for Kueue to admit the job.",
+                self._kueue_job_name,
                 reason,
-                self.job_poll_interval,
             )
             ti.xcom_push(key="kueue_suspend_reason", value=reason)
         else:
             self.log.info(
-                "Job '%s' is suspended by Kueue, deferring poll for %s seconds.",
-                job_name,
-                self.job_poll_interval,
+                "Job '%s' is suspended by Kueue, waiting for Kueue to admit the job.",
+                self._kueue_job_name,
             )
 
         from airflow.providers.cncf.kubernetes.triggers.job import (
@@ -192,9 +201,15 @@ class KubernetesStartKueueJobOperator(KubernetesJobOperator):
 
         self.defer(
             trigger=KueueSuspendTrigger(
-                job_name=job_name,
-                job_namespace=job_namespace,
+                job_name=self._kueue_job_name,
+                job_namespace=self._kueue_job_namespace,
+                job_uid=self._kueue_job_uid,
                 poll_interval=self.job_poll_interval,
+                use_watch=self.use_watch,
+                kubernetes_conn_id=self.kubernetes_conn_id,
+                cluster_context=self.cluster_context,
+                config_file=self.config_file,
+                in_cluster=self.in_cluster,
             ),
             method_name="execute_complete",
         )
@@ -205,7 +220,7 @@ class KubernetesStartKueueJobOperator(KubernetesJobOperator):
         ti.xcom_push(key="kueue_suspend_reason", value="")  # clear the suspend reason
         self.log.info(
             "Job '%s' has been admitted by Kueue, waiting for pods and completion.",
-            self.job.metadata.name,
+            self._kueue_job_name,
         )
         self.pods = self.get_pods(pod_request_obj=self.pod_request_obj, context=context)
 
@@ -220,8 +235,8 @@ class KubernetesStartKueueJobOperator(KubernetesJobOperator):
                     xcom_result.append(self.extract_xcom(pod=pod))
 
         self.job = self.hook.wait_until_job_complete(
-            job_name=self.job.metadata.name,
-            namespace=self.job.metadata.namespace,
+            job_name=self._kueue_job_name,
+            namespace=self._kueue_job_namespace,
             job_poll_interval=self.job_poll_interval,
         )
 
@@ -238,20 +253,24 @@ class KubernetesStartKueueJobOperator(KubernetesJobOperator):
 
         if error_message := self.hook.is_job_failed(job=self.job):
             raise AirflowException(
-                f"Kubernetes job '{self.job.metadata.name}' failed with error '{error_message}'"
+                f"Kubernetes job '{self._kueue_job_name}' failed with error '{error_message}'"
             )
 
         if self.do_xcom_push:
             return xcom_result[0] if self.unwrap_single and len(xcom_result) == 1 else xcom_result
 
     def execute_complete(self, context, event):
-        # Re-fetch job status using the sync hook in the worker process.
-        # The trigger (KueueSuspendTrigger) does NOT query K8s — it only
-        # sleeps, so the actual API call happens here in the worker.
+        # Restore job identifiers from the trigger event — the operator is
+        # reconstructed from the DAG definition on resume, so instance
+        # attributes set in execute() are lost.
+        self._kueue_job_name = event["job_name"]
+        self._kueue_job_namespace = event["job_namespace"]
+        self._kueue_job_uid = event.get("job_uid", "")
+
         try:
             self.job = self.hook.get_job_status(
-                job_name=self.job.metadata.name,
-                namespace=self.job.metadata.namespace,
+                job_name=self._kueue_job_name,
+                namespace=self._kueue_job_namespace,
             )
 
             if self.hook.is_job_suspended(self.job):
