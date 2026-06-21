@@ -682,7 +682,7 @@ class KubernetesHook(BaseHook, PodOperatorHookProtocol):
                 self.log.info("The job '%s' is suspended by Kueue, waiting for resources...", job_name)
                 sleep(job_poll_interval)
                 continue
-            elif self.is_job_complete(job=job):
+            if self.is_job_complete(job=job):
                 return job
             self.log.info("The job '%s' is incomplete. Sleeping for %i sec.", job_name, job_poll_interval)
             sleep(job_poll_interval)
@@ -1356,10 +1356,10 @@ class AsyncKubernetesHook(KubernetesHook):
             self.log.info("Requesting status for the job '%s' ", name)
             job: V1Job = await self.get_job_status(name=name, namespace=namespace)
             if self.is_job_suspended(job):
-                self.log.info("The job '%s' is suspended by Kueue, waiting for resources...", job_name)
+                self.log.info("The job '%s' is suspended by Kueue, waiting for resources...", name)
                 await asyncio.sleep(poll_interval)
                 continue
-            elif self.is_job_complete(job=job):
+            if self.is_job_complete(job=job):
                 return job
             self.log.info("The job '%s' is incomplete. Sleeping for %i sec.", name, poll_interval)
             await asyncio.sleep(poll_interval)

@@ -142,7 +142,8 @@ class KubernetesJobTrigger(BaseTrigger):
                     xcom_result = await loop.run_in_executor(None, self.pod_manager.extract_xcom, pod)
                     xcom_results.append(xcom_result)
             job: V1Job = await self.hook.wait_until_job_complete(
-                name=self.job_name, namespace=self.job_namespace,
+                name=self.job_name,
+                namespace=self.job_namespace,
             )
         else:
             # No pods were discovered — the job was suspended by Kueue when the
@@ -155,7 +156,8 @@ class KubernetesJobTrigger(BaseTrigger):
                     self.job_name,
                 )
             job: V1Job = await self.hook.wait_until_job_complete(
-                name=self.job_name, namespace=self.job_namespace,
+                name=self.job_name,
+                namespace=self.job_namespace,
             )
         job_dict = job.to_dict()
         error_message = self.hook.is_job_failed(job=job)

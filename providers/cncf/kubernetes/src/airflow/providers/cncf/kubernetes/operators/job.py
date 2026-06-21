@@ -225,7 +225,7 @@ class KubernetesJobOperator(KubernetesPodOperator):
                 if self.hook.is_job_suspended(job=self.job):
                     self.log.info(
                         "Job '%s' is suspended by Kueue, skipping pod discovery until resources are available",
-                        self.job.metadata.name
+                        self.job.metadata.name,
                     )
                 else:
                     self.pods: Sequence[k8s.V1Pod] = self.get_pods(
@@ -240,7 +240,7 @@ class KubernetesJobOperator(KubernetesPodOperator):
 
                 if self.do_xcom_push:
                     xcom_result = []
-                    if hasattr(self, 'pods') and self.pods:
+                    if hasattr(self, "pods") and self.pods:
                         for pod in self.pods:
                             self.pod_manager.await_container_completion(
                                 pod=pod, container_name=self.base_container_name
@@ -253,7 +253,7 @@ class KubernetesJobOperator(KubernetesPodOperator):
                     job_poll_interval=self.job_poll_interval,
                 )
                 if self.get_logs:
-                    if not self.hook.is_job_suspended(job=self.job) and hasattr(self, 'pods'):
+                    if not self.hook.is_job_suspended(job=self.job) and hasattr(self, "pods"):
                         for pod in self.pods:
                             self.pod_manager.fetch_requested_container_logs(
                                 pod=pod,
@@ -273,10 +273,10 @@ class KubernetesJobOperator(KubernetesPodOperator):
             self._cleanup_monitoring_pods(context)
 
     def execute_deferrable(self):
-        pod_names = [pod.metadata.name for pod in self.pods] if hasattr(self, 'pods') and self.pods else []
+        pod_names = [pod.metadata.name for pod in self.pods] if hasattr(self, "pods") and self.pods else []
         pod_namespace = (
             self.pods[0].metadata.namespace
-            if hasattr(self, 'pods') and self.pods
+            if hasattr(self, "pods") and self.pods
             else self.job.metadata.namespace
         )
         self.defer(
