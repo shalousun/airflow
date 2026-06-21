@@ -111,19 +111,6 @@ class KubernetesStartKueueJobOperator(KubernetesJobOperator):
 
     template_fields = tuple({"queue_name"} | set(KubernetesJobOperator.template_fields))
 
-    def execute(self, context):
-        # Kueue Jobs always start suspended (suspend=True).  When
-        # wait_until_job_complete is set, automatically use the deferrable
-        # path so the task doesn't remain in RUNNING state while the Job is
-        # waiting for cluster resources — it transitions to DEFERRED instead.
-        if self.wait_until_job_complete and not self.deferrable:
-            self.log.info(
-                "Kueue Job '%s' will be deferred while waiting for resources.",
-                self.name,
-            )
-            self.deferrable = True
-        return super().execute(context)
-
     def __init__(self, queue_name: str, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.queue_name = queue_name
