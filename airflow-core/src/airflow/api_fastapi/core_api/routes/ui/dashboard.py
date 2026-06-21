@@ -58,10 +58,14 @@ def historical_metrics(
     start_date: DateTimeQuery,
     readable_dags_filter: ReadableDagsFilterDep,
     end_date: OptionalDateTimeQuery = None,
+    dag_id: Optional[str] = None,
 ) -> HistoricalMetricDataResponse:
     """Return cluster activity historical metrics."""
     current_time = timezone.utcnow()
     permitted_dag_ids = cast("set[str]", readable_dags_filter.value)
+
+    if dag_id:
+        permitted_dag_ids = {dag_id} & permitted_dag_ids
 
     end_bound = end_date if end_date is not None else current_time
     dag_run_filters = [

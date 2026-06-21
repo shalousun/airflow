@@ -650,6 +650,15 @@ paths:
           - type: string
           - type: 'null'
           title: End Date
+      - name: dag_id
+        in: query
+        required: false
+        schema:
+          anyOf:
+            - type: string
+            - type: 'null'
+          title: DAG ID
+          description: Filter metrics for a specific DAG ID
       responses:
         '200':
           description: Successful Response
