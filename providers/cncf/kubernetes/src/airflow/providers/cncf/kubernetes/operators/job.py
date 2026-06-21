@@ -240,12 +240,13 @@ class KubernetesJobOperator(KubernetesPodOperator):
 
                 if self.do_xcom_push:
                     xcom_result = []
-                    for pod in self.pods:
-                        self.pod_manager.await_container_completion(
-                            pod=pod, container_name=self.base_container_name
-                        )
-                        self.pod_manager.await_xcom_sidecar_container_start(pod=pod)
-                        xcom_result.append(self.extract_xcom(pod=pod))
+                    if hasattr(self, 'pods') and self.pods:
+                        for pod in self.pods:
+                            self.pod_manager.await_container_completion(
+                                pod=pod, container_name=self.base_container_name
+                            )
+                            self.pod_manager.await_xcom_sidecar_container_start(pod=pod)
+                            xcom_result.append(self.extract_xcom(pod=pod))
                 self.job = self.hook.wait_until_job_complete(
                     job_name=self.job.metadata.name,
                     namespace=self.job.metadata.namespace,
@@ -272,12 +273,18 @@ class KubernetesJobOperator(KubernetesPodOperator):
             self._cleanup_monitoring_pods(context)
 
     def execute_deferrable(self):
+        pod_names = [pod.metadata.name for pod in self.pods] if hasattr(self, 'pods') and self.pods else []
+        pod_namespace = (
+            self.pods[0].metadata.namespace
+            if hasattr(self, 'pods') and self.pods
+            else self.job.metadata.namespace
+        )
         self.defer(
             trigger=KubernetesJobTrigger(
                 job_name=self.job.metadata.name,
                 job_namespace=self.job.metadata.namespace,
-                pod_names=[pod.metadata.name for pod in self.pods],
-                pod_namespace=self.pods[0].metadata.namespace,
+                pod_names=pod_names,
+                pod_namespace=pod_namespace,
                 base_container_name=self.base_container_name,
                 kubernetes_conn_id=self.kubernetes_conn_id,
                 cluster_context=self.cluster_context,

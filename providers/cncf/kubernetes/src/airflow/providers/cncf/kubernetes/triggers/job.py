@@ -121,24 +121,42 @@ class KubernetesJobTrigger(BaseTrigger):
 
     async def run(self) -> AsyncIterator[TriggerEvent]:
         """Get current job status and yield a TriggerEvent."""
-        if self.do_xcom_push:
-            xcom_results = []
-            for pod_name in self.pod_names:
-                pod = await self.hook.get_pod(name=pod_name, namespace=self.pod_namespace)
-                await self.hook.wait_until_container_complete(
-                    name=pod_name, namespace=self.pod_namespace, container_name=self.base_container_name
+        xcom_results: list[Any] = []
+        if self.pod_names:
+            # Pods were already discovered by the operator — wait for containers
+            # and push xcom before waiting for the overall Job to complete.
+            if self.do_xcom_push:
+                for pod_name in self.pod_names:
+                    pod = await self.hook.get_pod(name=pod_name, namespace=self.pod_namespace)
+                    await self.hook.wait_until_container_complete(
+                        name=pod_name, namespace=self.pod_namespace, container_name=self.base_container_name
+                    )
+                    self.log.info("Checking if xcom sidecar container is started.")
+                    await self.hook.wait_until_container_started(
+                        name=pod_name,
+                        namespace=self.pod_namespace,
+                        container_name=PodDefaults.SIDECAR_CONTAINER_NAME,
+                    )
+                    self.log.info("Extracting result from xcom sidecar container.")
+                    loop = asyncio.get_running_loop()
+                    xcom_result = await loop.run_in_executor(None, self.pod_manager.extract_xcom, pod)
+                    xcom_results.append(xcom_result)
+            job: V1Job = await self.hook.wait_until_job_complete(
+                name=self.job_name, namespace=self.job_namespace,
+            )
+        else:
+            # No pods were discovered — the job was suspended by Kueue when the
+            # operator deferred.  wait_until_job_complete handles the
+            # suspension polling internally.
+            if self.do_xcom_push:
+                self.log.warning(
+                    "XCom push is enabled but no pods were discovered for job '%s' "
+                    "(job was suspended by Kueue). XCom will be empty.",
+                    self.job_name,
                 )
-                self.log.info("Checking if xcom sidecar container is started.")
-                await self.hook.wait_until_container_started(
-                    name=pod_name,
-                    namespace=self.pod_namespace,
-                    container_name=PodDefaults.SIDECAR_CONTAINER_NAME,
-                )
-                self.log.info("Extracting result from xcom sidecar container.")
-                loop = asyncio.get_running_loop()
-                xcom_result = await loop.run_in_executor(None, self.pod_manager.extract_xcom, pod)
-                xcom_results.append(xcom_result)
-        job: V1Job = await self.hook.wait_until_job_complete(name=self.job_name, namespace=self.job_namespace)
+            job: V1Job = await self.hook.wait_until_job_complete(
+                name=self.job_name, namespace=self.job_namespace,
+            )
         job_dict = job.to_dict()
         error_message = self.hook.is_job_failed(job=job)
         yield TriggerEvent(
